@@ -43,6 +43,10 @@ pub struct BookmarkRenameArgs {
     /// The new name of the bookmark
     #[arg(value_parser = revset_util::parse_bookmark_name)]
     new: RefNameBuf,
+
+    /// Allow renaming even if the new bookmark name already exists
+    #[arg(long)]
+    overwrite_existing: bool,
 }
 
 pub fn cmd_bookmark_rename(
@@ -62,7 +66,7 @@ pub fn cmd_bookmark_rename(
     }
 
     let new_bookmark = &args.new;
-    if view.get_local_bookmark(new_bookmark).is_present() {
+    if !args.overwrite_existing && view.get_local_bookmark(new_bookmark).is_present() {
         return Err(user_error(format!(
             "Bookmark already exists: {new_bookmark}",
             new_bookmark = new_bookmark.as_symbol()
@@ -70,10 +74,6 @@ pub fn cmd_bookmark_rename(
     }
 
     let mut tx = workspace_command.start_transaction();
-    tx.repo_mut()
-        .set_local_bookmark_target(new_bookmark, ref_target);
-    tx.repo_mut()
-        .set_local_bookmark_target(old_bookmark, RefTarget::absent());
 
     let remote_matcher = match default_ignored_remote_name(tx.repo().store()) {
         Some(remote) => StringExpression::exact(remote).negated().to_matcher(),
@@ -92,19 +92,42 @@ pub fn cmd_bookmark_rename(
         })
         .map(|(symbol, _)| symbol.remote.to_owned())
         .collect_vec();
-    let mut tracked_remote_bookmarks_exist_for_new_bookmark = false;
+    let old_tracked_remote_set: HashSet<_> = old_tracked_remotes.iter().cloned().collect();
+    let mut existing_present_tracked_remotes = HashSet::new();
     let existing_untracked_remotes = tx
         .base_repo()
         .view()
         .remote_bookmarks_matching(&StringMatcher::exact(new_bookmark), &remote_matcher)
-        .filter(|(_, remote_ref)| {
+        .filter_map(|(symbol, remote_ref)| {
             if remote_ref.is_tracked() {
-                tracked_remote_bookmarks_exist_for_new_bookmark = true;
+                if remote_ref.is_present() {
+                    existing_present_tracked_remotes.insert(symbol.remote.to_owned());
+                }
+                // absent+tracked remotes are cleaned up by deleting the local
+                // bookmark below
+                None
+            } else {
+                Some(symbol.remote.to_owned())
             }
-            !remote_ref.is_tracked()
         })
-        .map(|(symbol, _)| symbol.remote.to_owned())
         .collect::<HashSet<_>>();
+
+    if args.overwrite_existing {
+        // Delete the overwritten bookmark first. This cleans up any
+        // absent+tracked remote refs via set_local_bookmark_target.
+        tx.repo_mut()
+            .set_local_bookmark_target(new_bookmark, RefTarget::absent());
+        // Untrack present+tracked remotes of the overwritten bookmark.
+        for remote in &existing_present_tracked_remotes {
+            tx.repo_mut()
+                .untrack_remote_bookmark(new_bookmark.to_remote_symbol(remote));
+        }
+    }
+    tx.repo_mut()
+        .set_local_bookmark_target(new_bookmark, ref_target);
+    tx.repo_mut()
+        .set_local_bookmark_target(old_bookmark, RefTarget::absent());
+
     // preserve tracking state of old bookmark
     for old_remote in old_tracked_remotes {
         let new_remote_bookmark = new_bookmark.to_remote_symbol(&old_remote);
@@ -124,7 +147,33 @@ pub fn cmd_bookmark_rename(
             )?;
             continue;
         }
+        // Skip re-tracking remotes that belonged to the overwritten bookmark.
+        // Their remote refs still contain the overwritten bookmark's data, so
+        // track_remote_bookmark would incorrectly merge that into the local.
+        if existing_present_tracked_remotes.contains(new_remote_bookmark.remote) {
+            continue;
+        }
         tx.repo_mut().track_remote_bookmark(new_remote_bookmark)?;
+    }
+
+    // Warn about present+tracked remotes of the overwritten bookmark where the
+    // old bookmark was untracked on the same remote.
+    if args.overwrite_existing {
+        for remote in &existing_present_tracked_remotes {
+            if old_tracked_remote_set.contains(remote) {
+                continue;
+            }
+            writeln!(
+                ui.warning_default(),
+                "Tracking of remote bookmark {new_bookmark}@{remote} was dropped.",
+                new_bookmark = new_bookmark.as_symbol(),
+                remote = remote.as_symbol(),
+            )?;
+            writeln!(
+                ui.hint_default(),
+                "Use `jj bookmark track` to re-track if needed.",
+            )?;
+        }
     }
 
     tx.finish(
@@ -151,7 +200,7 @@ pub fn cmd_bookmark_rename(
             new_bookmark = new_bookmark.as_symbol()
         )?;
     }
-    if tracked_remote_bookmarks_exist_for_new_bookmark {
+    if !existing_present_tracked_remotes.is_empty() && !args.overwrite_existing {
         // This isn't an error because bookmark renaming can't be propagated to
         // the remote immediately. "rename old new && rename new old" should be
         // allowed even if the original old bookmark had tracked remotes.

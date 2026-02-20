@@ -630,6 +630,15 @@ fn test_bookmark_rename() {
     [exit status: 1]
     ");
 
+    let output = work_dir.run_jj([
+        "bookmark",
+        "rename",
+        "--overwrite-existing",
+        "blocal1",
+        "bexist",
+    ]);
+    insta::assert_snapshot!(output, @"");
+
     work_dir.run_jj(["new"]).success();
     work_dir.run_jj(["describe", "-m=commit-2"]).success();
     work_dir
@@ -661,7 +670,7 @@ fn test_bookmark_rename() {
     insta::assert_snapshot!(output, @"
     ------- stderr -------
     Changes to push to origin:
-      Add bookmark bremote2 to a9d7418c1c3f
+      Add bookmark bremote2 to 1e76d54fcfce
     [EOF]
     ");
     work_dir
@@ -680,7 +689,47 @@ fn test_bookmark_rename() {
     [EOF]
     ");
 
+    // overwrite-existing where the overwritten bookmark has a present+tracked
+    // remote: the tracked state should be dropped and local should move.
+    work_dir
+        .run_jj(["op", "restore", &op_id_after_rename])
+        .success();
+    work_dir.run_jj(["new"]).success();
+    work_dir.run_jj(["describe", "-m=commit-3"]).success();
+    work_dir
+        .run_jj(["bookmark", "create", "boverwrite"])
+        .success();
+    work_dir
+        .run_jj(["git", "push", "--allow-new", "-b=boverwrite"])
+        .success();
+    // Now rename bremote2 -> boverwrite with --overwrite-existing.
+    // boverwrite@origin was tracked; after overwrite it should be untracked
+    // and the local should point to bremote2's target (commit-2).
+    let output = work_dir.run_jj([
+        "bookmark",
+        "rename",
+        "--overwrite-existing",
+        "bremote2",
+        "boverwrite",
+    ]);
+    insta::assert_snapshot!(output, @"
+    ------- stderr -------
+    Warning: The working-copy commit in workspace 'default' became immutable, so a new commit has been created on top of it.
+    Working copy  (@) now at: oupztwtk 253159b5 (empty) (no description set)
+    Parent commit (@-)      : pzsxstzt 8924a883 boverwrite@origin | (empty) commit-3
+    [EOF]
+    ");
+    let output = work_dir.run_jj(["bookmark", "list", "--all", "boverwrite"]);
+    insta::assert_snapshot!(output, @"
+    boverwrite: kmkuslsw 1e76d54f (empty) commit-2
+    boverwrite@origin: pzsxstzt 8924a883 (empty) commit-3
+    [EOF]
+    ");
+
     // rename an untracked bookmark
+    work_dir
+        .run_jj(["op", "restore", &op_id_after_rename])
+        .success();
     work_dir
         .run_jj(["bookmark", "untrack", "buntracked"])
         .success();
