@@ -1400,6 +1400,8 @@ Upload changes to Gerrit for code review, or update existing changes.
 
 Uploading in a set of revisions to Gerrit creates a single "change" for each revision included in the revset. These changes are then available for review on your Gerrit instance.
 
+Upon success, each uploaded change will get a bookmark corresponding to the URL of the gerrit change.
+
 Note: The Gerrit commit Id may not match that of your local commit Id, since we add a `Change-Id` footer to the commit message if one does not already exist. This ID is based off the jj Change-Id, but is not the same.
 
 If a change already exists for a given revision (i.e. it contains the same `Change-Id`), this command will update the contents of the existing change to match.

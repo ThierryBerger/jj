@@ -822,3 +822,71 @@ fn test_gerrit_upload_rejected_by_remote() {
     [exit status: 1]
     ");
 }
+
+#[test]
+fn test_gerrit_upload_sets_bookmark() {
+    let test_env = TestEnvironment::default();
+    test_env
+        .run_jj_in(".", ["git", "init", "--colocate", "remote"])
+        .success();
+    let remote_dir = test_env.work_dir("remote");
+    create_commit(&remote_dir, "a", &[]);
+
+    // create a hook on the remote that prevents pushing
+    let hook_path = test_env
+        .env_root()
+        .join("remote")
+        .join(".git")
+        .join("hooks")
+        .join("update");
+
+    std::fs::write(
+        &hook_path,
+        [
+            "#!/bin/sh",
+            "echo 'SUCCESS'",
+            "echo",
+            "echo '  https://gerrit.example.com/c/project/+/12345 parent [WIP] [NEW]'",
+            "echo '  https://gerrit.example.com/c/project/+/67890 child [WIP] [NEW]'",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    test_env
+        .run_jj_in(".", ["git", "clone", "remote", "local"])
+        .success();
+    let local_dir = test_env.work_dir("local");
+    create_commit(&local_dir, "parent", &["a@origin"]);
+    create_commit(&local_dir, "child", &["parent"]);
+
+    let output = local_dir.run_jj(["gerrit", "upload", "-r", "child", "--remote-branch=main"]);
+    insta::assert_snapshot!(output, @r"
+    ------- stderr -------
+    Found 1 heads to push to Gerrit (remote 'origin'), target branch 'main'
+    Pushing yqosqzyt e90e128c child | child
+    remote: SUCCESS        
+    remote: 
+    remote:   https://gerrit.example.com/c/project/+/12345 parent [WIP] [NEW]        
+    remote:   https://gerrit.example.com/c/project/+/67890 child [WIP] [NEW]        
+    [EOF]
+    ");
+
+    let output = local_dir.run_jj(["log"]);
+    insta::assert_snapshot!(output, @r"
+    @  yqosqzyt test.user@example.com 2001-02-03 08:05:14 child gerrit.example.com/c/project/+/67890 e90e128c
+    │  child
+    ○  mzvwutvl test.user@example.com 2001-02-03 08:05:12 gerrit.example.com/c/project/+/12345 parent 2866aecb
+    │  parent
+    ◆  rlvkpnrz test.user@example.com 2001-02-03 08:05:09 a@origin 7d980be7
+    │  a
+    ◆  zzzzzzzz root() 00000000
+    [EOF]
+    ");
+}

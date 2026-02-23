@@ -97,6 +97,19 @@ The remote used to push is determined as follows:
   default remote.
 - To upload to a specific remote as a one-off thing, use `--remote <remote name>`
 
+# Getting the gerrit URL for a change
+After running `jj gerrit upload` on a revision, jj will create a bookmark
+associated with said revision containing the gerrit URL.
+
+You should be able to access this programmatically by running something like:
+```shell
+$ jj log -r @ -T 'local_bookmarks.filter(|b| b.name().contains("/c/"))'
+```
+
+Unfortunately, these bookmarks are indistinguishable from other bookmarks, and
+thus we need a bit of a hack (the url should always contain "/c/") to filter
+to only gerrit urls.
+
 ## Updating changes after review
 
 To address review feedback, update your revisions, then run `jj gerrit

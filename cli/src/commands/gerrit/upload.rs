@@ -23,8 +23,11 @@ use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
 use jj_lib::git;
 use jj_lib::git::GitRefUpdate;
+use jj_lib::git::GitSubprocessCallback;
 use jj_lib::git::GitSubprocessOptions;
 use jj_lib::object_id::ObjectId as _;
+use jj_lib::op_store::RefTarget;
+use jj_lib::ref_name::RefNameBuf;
 use jj_lib::repo::Repo as _;
 use jj_lib::revset::RevsetExpression;
 use jj_lib::settings::UserSettings;
@@ -32,6 +35,7 @@ use jj_lib::store::Store;
 use jj_lib::trailer::Trailer;
 use jj_lib::trailer::parse_description_trailers;
 use pollster::FutureExt as _;
+use regex::Regex;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::RevisionArg;
@@ -49,6 +53,9 @@ use crate::ui::Ui;
 /// Uploading in a set of revisions to Gerrit creates a single "change" for
 /// each revision included in the revset. These changes are then available
 /// for review on your Gerrit instance.
+///
+/// Upon success, each uploaded change will get a bookmark corresponding
+/// to the URL of the gerrit change.
 ///
 /// Note: The Gerrit commit Id may not match that of your local commit Id,
 /// since we add a `Change-Id` footer to the commit message if one does not
@@ -372,6 +379,72 @@ fn push_options(args: &UploadArgs) -> Result<Vec<String>, CommandError> {
     .collect())
 }
 
+fn collect_urls_and_title(lines: &[Vec<u8>]) -> Vec<(String, String)> {
+    // Gerrit doesn't appear to have any documentation on what the remote should
+    // print. I don't know if it's standardized, but it *appears* to output the
+    // following:
+    // Resolving deltas: 100%
+    // Replicating objects... done
+    // Processing changes: refs: 1, updated: 1, done
+    //
+    // SUCCESS
+    //
+    //   $URL1 $DESCRIPTION1 [WIP] [NEW]
+    //   $URL2 $DESCRIPTION2
+    let url_line = Regex::new(r"^  (https://[^ ]+) (.*?)(?: \[[A-Z]*\])*$").unwrap();
+    lines
+        .iter()
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .skip_while(|&line| line != "SUCCESS")
+        .filter(|line| line.starts_with("  https://"))
+        .filter_map(|line| url_line.captures(line))
+        .map(|captures| (captures[1].to_string(), captures[2].to_string()))
+        .collect()
+}
+
+// TeeCallback acts like the "tee" command in unix.
+// It prints to the UI, but also captures the remote sideband output from git.
+struct TeeCallback<'a> {
+    ui: GitSubprocessUi<'a>,
+    lines: Vec<Vec<u8>>,
+}
+
+impl<'a> TeeCallback<'a> {
+    fn new(ui: &'a Ui) -> Self {
+        Self {
+            ui: GitSubprocessUi::new(ui),
+            lines: vec![],
+        }
+    }
+}
+
+impl GitSubprocessCallback for TeeCallback<'_> {
+    fn needs_progress(&self) -> bool {
+        self.ui.needs_progress()
+    }
+
+    fn progress(&mut self, progress: &git::GitProgress) -> std::io::Result<()> {
+        self.ui.progress(progress)
+    }
+
+    fn local_sideband(
+        &mut self,
+        message: &[u8],
+        term: Option<git::GitSidebandLineTerminator>,
+    ) -> std::io::Result<()> {
+        self.ui.local_sideband(message, term)
+    }
+
+    fn remote_sideband(
+        &mut self,
+        message: &[u8],
+        term: Option<git::GitSidebandLineTerminator>,
+    ) -> std::io::Result<()> {
+        self.lines.push(message.to_vec());
+        self.ui.remote_sideband(message, term)
+    }
+}
+
 pub fn cmd_gerrit_upload(
     ui: &mut Ui,
     command: &CommandHelper,
@@ -487,6 +560,11 @@ pub fn cmd_gerrit_upload(
         }
     }
 
+    let id_and_desc = to_upload
+        .iter()
+        .map(|c| (c.id().clone(), c.description().to_string()))
+        .collect_vec();
+
     let mut old_to_new: HashMap<CommitId, Commit> = HashMap::new();
     for original_commit in to_upload.into_iter().rev() {
         let trailers = parse_description_trailers(original_commit.description());
@@ -595,6 +673,8 @@ pub fn cmd_gerrit_upload(
         remote_branch,
     )?;
 
+    let mut urls_to_desc = HashMap::new();
+
     // NOTE (aseipp): because we are pushing everything to the same remote ref,
     // we have to loop and push each commit one at a time, even though
     // push_updates in theory supports multiple GitRefUpdates at once, because
@@ -620,6 +700,8 @@ pub fn cmd_gerrit_upload(
 
         let new_commit = old_to_new.get(head).unwrap();
 
+        let mut callback = TeeCallback::new(ui);
+
         // how do we get better errors from the remote? 'git push' tells us
         // about rejected refs AND ALSO '(nothing changed)' when there are no
         // changes to push, but we don't get that here.
@@ -633,7 +715,7 @@ pub fn cmd_gerrit_upload(
                 new_target: Some(new_commit.id().clone()),
             }],
             &push_options.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            &mut GitSubprocessUi::new(ui),
+            &mut callback,
         )
         // Despite the fact that a manual git push will error out with 'no new
         // changes' if you're up to date, this git backend appears to silently
@@ -652,6 +734,54 @@ pub fn cmd_gerrit_upload(
         if !push_stats.all_ok() {
             return Err(user_error("Failed to push all changes to gerrit"));
         }
+
+        for (url, desc) in collect_urls_and_title(&callback.lines) {
+            // Intentionally override the mapping. This can happen if you upload a tree.
+            urls_to_desc.insert(url, desc);
+        }
+    }
+
+    let mut tx = workspace_command.start_transaction();
+    let mut changes = false;
+    for (url, desc) in urls_to_desc {
+        let matches: Vec<_> = id_and_desc
+            .iter()
+            .filter(|(_, d)| d.starts_with(&desc))
+            .map(|(id, _)| id)
+            .collect();
+        if matches.is_empty() {
+            // This probably means that the gerrit server responded with
+            // something that wasn't an actual code review URL.
+            // Let's ignore it.
+        } else if matches.len() == 1 {
+            // We only allow https URLs, so unwrap should always succeed.
+            // We need to strip the protocol because git doesn't support ":" in branch
+            // names. TODO(#6664): Once #6664 is completed, we should instead
+            // directly associate the URL with the change.
+            let bookmark_name = RefNameBuf::from(url.strip_prefix("https://").unwrap());
+            let target = RefTarget::normal(matches[0].clone());
+            if tx.repo().view().get_local_bookmark(&bookmark_name) != &target {
+                // Prevent tx.finish() from writing "Nothing changed" when the
+                // push succeeds but the URL doesn't change.
+                changes = true;
+                tx.repo_mut()
+                    .set_local_bookmark_target(&bookmark_name, target);
+            }
+        } else {
+            writeln!(
+                ui.warning_default(),
+                "Unable to unambiguously associate {url} with a change because multiple commits \
+                 start with '{desc}"
+            )?;
+            writeln!(
+                ui.hint_default(),
+                "You likely uploaded multiple commits with the same first line of the description"
+            )?;
+        }
+    }
+
+    if changes {
+        tx.finish(ui, "Add bookmarks for uploaded gerrit URLs")?;
     }
     Ok(())
 }

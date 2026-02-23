@@ -87,6 +87,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `revsets.bookmark-advance-from` and `revsets.bookmark-advance-to`.
   The command is heavily inspired by the longstanding community alias `jj tug`.
 
+* `jj gerrit upload` now adds the gerrit URL to the change as a bookmark, making
+  it possible to work out the URL of a change.
+
 ### Fixed bugs
 
 ## [0.38.0] - 2026-02-04
