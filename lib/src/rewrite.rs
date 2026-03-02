@@ -25,7 +25,6 @@ use futures::try_join;
 use indexmap::IndexMap;
 use indexmap::IndexSet;
 use itertools::Itertools as _;
-use pollster::FutureExt as _;
 use tracing::instrument;
 
 use crate::backend::BackendError;
@@ -301,7 +300,7 @@ impl<'repo> CommitRewriter<'repo> {
         self,
         empty: EmptyBehavior,
     ) -> BackendResult<Option<CommitBuilder<'repo>>> {
-        let old_parents_fut = self.old_commit.parents_async();
+        let old_parents_fut = self.old_commit.parents();
         let new_parents_fut = try_join_all(
             self.new_parents
                 .iter()
@@ -445,25 +444,29 @@ pub async fn rebase_to_dest_parent(
         return Ok(source.tree());
     }
 
-    let diffs: Vec<_> = sources
-        .iter()
-        .map(|source| -> BackendResult<_> {
-            Ok(Diff::new(
-                (
-                    source.parent_tree(repo)?,
-                    format!("{} (original parents)", source.parents_conflict_label()?),
+    let diffs: Vec<_> = try_join_all(sources.iter().map(async |source| -> BackendResult<_> {
+        Ok(Diff::new(
+            (
+                source.parent_tree(repo).await?,
+                format!(
+                    "{} (original parents)",
+                    source.parents_conflict_label().await?
                 ),
-                (
-                    source.tree(),
-                    format!("{} (original revision)", source.conflict_label()),
-                ),
-            ))
-        })
-        .try_collect()?;
+            ),
+            (
+                source.tree(),
+                format!("{} (original revision)", source.conflict_label()),
+            ),
+        ))
+    }))
+    .await?;
     MergedTree::merge(Merge::from_diffs(
         (
-            destination.parent_tree(repo)?,
-            format!("{} (new parents)", destination.parents_conflict_label()?),
+            destination.parent_tree(repo).await?,
+            format!(
+                "{} (new parents)",
+                destination.parents_conflict_label().await?
+            ),
         ),
         diffs,
     ))
@@ -570,12 +573,12 @@ impl ComputedMoveCommits {
         self.to_abandon.extend(commit_ids);
     }
 
-    pub fn apply(
+    pub async fn apply(
         self,
         mut_repo: &mut MutableRepo,
         options: &RebaseOptions,
     ) -> BackendResult<MoveCommitsStats> {
-        apply_move_commits(mut_repo, self, options)
+        apply_move_commits(mut_repo, self, options).await
     }
 }
 
@@ -587,12 +590,14 @@ impl ComputedMoveCommits {
 /// heads of the commits in `targets`. This assumes that commits in `target` and
 /// `new_child_ids` can be rewritten, and there will be no cycles in the
 /// resulting graph. Commits in `target` should be in reverse topological order.
-pub fn move_commits(
+pub async fn move_commits(
     mut_repo: &mut MutableRepo,
     loc: &MoveCommitsLocation,
     options: &RebaseOptions,
 ) -> BackendResult<MoveCommitsStats> {
-    compute_move_commits(mut_repo, loc)?.apply(mut_repo, options)
+    compute_move_commits(mut_repo, loc)?
+        .apply(mut_repo, options)
+        .await
 }
 
 pub fn compute_move_commits(
@@ -885,7 +890,7 @@ pub fn compute_move_commits(
     })
 }
 
-fn apply_move_commits(
+async fn apply_move_commits(
     mut_repo: &mut MutableRepo,
     commits: ComputedMoveCommits,
     options: &RebaseOptions,
@@ -939,7 +944,7 @@ fn apply_move_commits(
                 Ok(())
             },
         )
-        .block_on()?;
+        .await?;
 
     Ok(MoveCommitsStats {
         num_rebased_targets,
@@ -1245,7 +1250,7 @@ impl CommitWithSelection {
     /// Returns a diff of labeled trees which represents the selected changes.
     /// This can be used with `MergedTree::merge` and `Merge::from_diffs` to
     /// apply the selected changes to a tree.
-    pub fn diff_with_labels(
+    pub async fn diff_with_labels(
         &self,
         parent_tree_label: &str,
         selected_tree_label: &str,
@@ -1253,7 +1258,7 @@ impl CommitWithSelection {
     ) -> BackendResult<Diff<(MergedTree, String)>> {
         let parent_tree_label = format!(
             "{} ({parent_tree_label})",
-            self.commit.parents_conflict_label()?
+            self.commit.parents_conflict_label().await?
         );
 
         let commit_label = self.commit.conflict_label();
@@ -1307,11 +1312,13 @@ pub async fn squash_commits<'repo>(
         // squash -r`)? The source tree will be unchanged in that case.
         source_commits.push(SourceCommit {
             commit: source,
-            diff: source.diff_with_labels(
-                "parents of squashed revision",
-                "selected changes for squash",
-                "squashed revision",
-            )?,
+            diff: source
+                .diff_with_labels(
+                    "parents of squashed revision",
+                    "selected changes for squash",
+                    "squashed revision",
+                )
+                .await?,
             abandon,
         });
     }

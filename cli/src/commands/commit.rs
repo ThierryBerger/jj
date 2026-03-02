@@ -19,7 +19,6 @@ use jj_lib::backend::Signature;
 use jj_lib::merge::Diff;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
-use pollster::FutureExt as _;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
@@ -108,7 +107,7 @@ pub(crate) struct CommitArgs {
 }
 
 #[instrument(skip_all)]
-pub(crate) fn cmd_commit(
+pub(crate) async fn cmd_commit(
     ui: &mut Ui,
     command: &CommandHelper,
     args: &CommitArgs,
@@ -140,7 +139,7 @@ pub(crate) fn cmd_commit(
         workspace_command.diff_selector(ui, args.tool.as_deref(), args.interactive)?;
     let text_editor = workspace_command.text_editor()?;
     let mut tx = workspace_command.start_transaction();
-    let base_tree = commit.parent_tree(tx.repo())?;
+    let base_tree = commit.parent_tree(tx.repo()).await?;
     let format_instructions = || {
         format!(
             "\
@@ -156,7 +155,10 @@ new working-copy commit.
     let tree = diff_selector.select(
         ui,
         Diff::new(&base_tree, &commit.tree()),
-        Diff::new(commit.parents_conflict_label()?, commit.conflict_label()),
+        Diff::new(
+            commit.parents_conflict_label().await?,
+            commit.conflict_label(),
+        ),
         matcher.as_ref(),
         format_instructions,
     )?;
@@ -199,7 +201,7 @@ new working-copy commit.
     };
     let description = if use_editor {
         commit_builder.set_description(description);
-        let temp_commit = commit_builder.write_hidden().block_on()?;
+        let temp_commit = commit_builder.write_hidden().await?;
         let intro = "";
         let description = description_template(ui, &tx, intro, &temp_commit)?;
         let description = edit_description(&text_editor, &description)?;
@@ -218,7 +220,7 @@ new working-copy commit.
         description
     };
     commit_builder.set_description(description);
-    let new_commit = commit_builder.write(tx.repo_mut()).block_on()?;
+    let new_commit = commit_builder.write(tx.repo_mut()).await?;
 
     let workspace_names = tx.repo().view().workspaces_for_wc_commit_id(commit.id());
     if !workspace_names.is_empty() {
@@ -226,13 +228,13 @@ new working-copy commit.
             .repo_mut()
             .new_commit(vec![new_commit.id().clone()], commit.tree())
             .write()
-            .block_on()?;
+            .await?;
 
         // Does nothing if there's no bookmarks to advance.
         tx.advance_bookmarks(advanceable_bookmarks, new_commit.id())?;
 
         for name in workspace_names {
-            tx.repo_mut().edit(name, &new_wc_commit).block_on().unwrap();
+            tx.repo_mut().edit(name, &new_wc_commit).await.unwrap();
         }
     }
     tx.finish(ui, format!("commit {}", commit.id().hex()))?;

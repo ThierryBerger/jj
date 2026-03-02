@@ -11,11 +11,13 @@ Contributions to this project must be accompanied by a Contributor License
 Agreement. You (or your employer) retain the copyright to your contribution;
 this simply gives us permission to use and redistribute your contributions as
 part of the project. Head over to <https://cla.developers.google.com/> to see
-your current agreements on file or to sign a new one.
+whether you have already signed the CLA or to sign it.
 
 You generally only need to submit a CLA once, so if you've already submitted one
 (even if it was for a different project), you probably don't need to do it
-again.
+again. In other words, the Google CLA is not scoped to a specific project. If
+you sign the Google CLA, it applies to other Google open-source projects as
+well (including future projects).
 
 ### Commit guidelines
 
@@ -43,7 +45,9 @@ the reviewers will help you provide a topic if you have difficulties choosing
 it. [How to Write a Git Commit Message] is a good
 guide if you're new to writing good commit messages. We are not particularly
 strict about the style, but please do explain the reason for the change unless
-it's obvious.
+it's obvious. If the PR closes an open issue or feature request for the
+project, include the `Closes #<issue-number>` or `Fixes #<issue-number>` in
+the commit description.
 
 [Conventional Commits]: https://www.conventionalcommits.org/en/v1.0.0/
 [How to Write a Git Commit Message]: https://cbea.ms/git-commit/

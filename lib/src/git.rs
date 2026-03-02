@@ -378,9 +378,18 @@ fn to_git_ref_name(kind: GitRefKind, symbol: RemoteRefSymbol<'_>) -> Option<GitR
             }
         }
         GitRefKind::Tag => {
+            // Only local tags are mapped. Remote tags don't exist in Git world.
             (remote == REMOTE_NAME_FOR_LOCAL_GIT_REPO).then(|| format!("refs/tags/{name}").into())
         }
     }
+}
+
+fn to_remote_tag_ref_name(symbol: RemoteRefSymbol<'_>) -> Option<GitRefNameBuf> {
+    let RemoteRefSymbol { name, remote } = symbol;
+    let name = name.as_str();
+    let remote = remote.as_str();
+    (remote != REMOTE_NAME_FOR_LOCAL_GIT_REPO)
+        .then(|| format!("{REMOTE_TAG_REF_NAMESPACE}{remote}/{name}").into())
 }
 
 #[derive(Debug, Error)]
@@ -1120,16 +1129,16 @@ pub fn export_some_refs(
         Some(value)
     }
 
-    let git_repo = get_git_repo(mut_repo.store())?;
-
     let AllRefsToExport { bookmarks, tags } = diff_refs_to_export(
         mut_repo.view(),
         mut_repo.store().root_commit_id(),
         &git_ref_filter,
     );
 
-    // TODO: Also check other worktrees' HEAD.
-    if let Ok(head_ref) = git_repo.find_reference("HEAD") {
+    let check_and_detach_head = |git_repo: &gix::Repository| -> Result<(), GitExportError> {
+        let Ok(head_ref) = git_repo.find_reference("HEAD") else {
+            return Ok(());
+        };
         let target_name = head_ref.target().try_name().map(|name| name.to_owned());
         if let Some((kind, symbol)) = target_name
             .as_ref()
@@ -1161,12 +1170,22 @@ pub fn export_some_refs(
             };
             if new_oid != current_oid.as_ref() {
                 update_git_head(
-                    &git_repo,
+                    git_repo,
                     gix::refs::transaction::PreviousValue::MustExistAndMatch(old_target),
                     current_oid,
                 )
                 .map_err(GitExportError::from_git)?;
             }
+        }
+        Ok(())
+    };
+
+    let git_repo = get_git_repo(mut_repo.store())?;
+
+    check_and_detach_head(&git_repo)?;
+    for worktree in git_repo.worktrees().map_err(GitExportError::from_git)? {
+        if let Ok(worktree_repo) = worktree.into_repo_with_possibly_inaccessible_worktree() {
+            check_and_detach_head(&worktree_repo)?;
         }
     }
 
@@ -1211,15 +1230,28 @@ fn export_refs_to_git(
             mut_repo.set_git_ref_target(&git_ref_name, new_target);
         }
     }
-    for (symbol, (old_oid, new_oid)) in refs.to_update {
+    for (symbol, (old_commit_oid, new_commit_oid)) in refs.to_update {
         let Some(git_ref_name) = to_git_ref_name(kind, symbol.as_ref()) else {
             failed.push((symbol, FailedRefExportReason::InvalidGitName));
             continue;
         };
-        if let Err(reason) = update_git_ref(git_repo, &git_ref_name, old_oid, new_oid) {
+        let new_ref_oid = match kind {
+            GitRefKind::Bookmark => None,
+            // Copy existing tag ref, which may point to annotated tag object.
+            GitRefKind::Tag => {
+                find_git_tag_oid_to_copy(mut_repo.view(), git_repo, &symbol.name, &new_commit_oid)
+            }
+        };
+        if let Err(reason) = update_git_ref(
+            git_repo,
+            &git_ref_name,
+            old_commit_oid,
+            new_commit_oid,
+            new_ref_oid,
+        ) {
             failed.push((symbol, reason));
         } else {
-            let new_target = RefTarget::normal(CommitId::from_bytes(new_oid.as_bytes()));
+            let new_target = RefTarget::normal(CommitId::from_bytes(new_commit_oid.as_bytes()));
             mut_repo.set_git_ref_target(&git_ref_name, new_target);
         }
     }
@@ -1392,6 +1424,33 @@ fn collect_changed_refs_to_export(
     }
 }
 
+/// Looks up tracked remote tag refs and returns the ref target object ID if
+/// peeled to the given commit ID.
+fn find_git_tag_oid_to_copy(
+    view: &View,
+    git_repo: &gix::Repository,
+    name: &RefName,
+    commit_oid: &gix::oid,
+) -> Option<gix::ObjectId> {
+    // Filter candidates by tag name and known commit id first
+    view.remote_tags_matching(&StringMatcher::exact(name), &StringMatcher::all())
+        .filter(|(_, remote_ref)| {
+            let maybe_id = remote_ref.tracked_target().as_normal();
+            maybe_id.is_some_and(|id| id.as_bytes() == commit_oid.as_bytes())
+        })
+        // Query existing Git ref and tag object
+        .filter_map(|(symbol, _)| {
+            let git_ref_name = to_remote_tag_ref_name(symbol)?;
+            git_repo.find_reference(git_ref_name.as_str()).ok()
+        })
+        // This usually holds because remote tags are managed by jj, but jj's
+        // view may be updated independently by undo/redo commands.
+        .filter(|git_ref| {
+            resolve_git_ref_to_commit_id(git_ref, Some(commit_oid)).as_deref() == Some(commit_oid)
+        })
+        .find_map(|git_ref| git_ref.inner.target.try_into_id().ok())
+}
+
 fn delete_git_ref(
     git_repo: &gix::Repository,
     git_ref_name: &GitRefName,
@@ -1415,11 +1474,14 @@ fn delete_git_ref(
     }
 }
 
+/// Creates new ref pointing to `new_ref_oid` or (peeled) `new_commit_oid`.
 fn create_git_ref(
     git_repo: &gix::Repository,
     git_ref_name: &GitRefName,
-    new_oid: gix::ObjectId,
+    new_commit_oid: gix::ObjectId,
+    new_ref_oid: Option<gix::ObjectId>,
 ) -> Result<(), FailedRefExportReason> {
+    let new_oid = new_ref_oid.unwrap_or(new_commit_oid);
     let constraint = gix::refs::transaction::PreviousValue::MustNotExist;
     let Err(set_err) =
         git_repo.reference(git_ref_name.as_str(), new_oid, constraint, "export from jj")
@@ -1435,20 +1497,24 @@ fn create_git_ref(
     };
     // The ref was added in jj and in git. We're good if and only if git
     // pointed it to our desired target.
-    if resolve_git_ref_to_commit_id(&git_ref, None) == Some(new_oid) {
+    if resolve_git_ref_to_commit_id(&git_ref, None) == Some(new_commit_oid) {
         Ok(())
     } else {
         Err(FailedRefExportReason::AddedInJjAddedInGit)
     }
 }
 
+/// Updates existing ref to point to `new_ref_oid` or (peeled) `new_commit_oid`.
 fn move_git_ref(
     git_repo: &gix::Repository,
     git_ref_name: &GitRefName,
-    old_oid: gix::ObjectId,
-    new_oid: gix::ObjectId,
+    old_commit_oid: gix::ObjectId,
+    new_commit_oid: gix::ObjectId,
+    new_ref_oid: Option<gix::ObjectId>,
 ) -> Result<(), FailedRefExportReason> {
-    let constraint = gix::refs::transaction::PreviousValue::MustExistAndMatch(old_oid.into());
+    let new_oid = new_ref_oid.unwrap_or(new_commit_oid);
+    let constraint =
+        gix::refs::transaction::PreviousValue::MustExistAndMatch(old_commit_oid.into());
     let Err(set_err) =
         git_repo.reference(git_ref_name.as_str(), new_oid, constraint, "export from jj")
     else {
@@ -1464,10 +1530,10 @@ fn move_git_ref(
         return Err(FailedRefExportReason::ModifiedInJjDeletedInGit);
     };
     // We still consider this a success if it was updated to our desired target
-    let git_commit_oid = resolve_git_ref_to_commit_id(&git_ref, Some(&old_oid));
-    if git_commit_oid == Some(new_oid) {
+    let git_commit_oid = resolve_git_ref_to_commit_id(&git_ref, Some(&old_commit_oid));
+    if git_commit_oid == Some(new_commit_oid) {
         Ok(())
-    } else if git_commit_oid == Some(old_oid) {
+    } else if git_commit_oid == Some(old_commit_oid) {
         // The reference would point to annotated tag, try again
         let constraint =
             gix::refs::transaction::PreviousValue::MustExistAndMatch(git_ref.inner.target);
@@ -1483,12 +1549,13 @@ fn move_git_ref(
 fn update_git_ref(
     git_repo: &gix::Repository,
     git_ref_name: &GitRefName,
-    old_oid: Option<gix::ObjectId>,
-    new_oid: gix::ObjectId,
+    old_commit_oid: Option<gix::ObjectId>,
+    new_commit_oid: gix::ObjectId,
+    new_ref_oid: Option<gix::ObjectId>,
 ) -> Result<(), FailedRefExportReason> {
-    match old_oid {
-        None => create_git_ref(git_repo, git_ref_name, new_oid),
-        Some(old_oid) => move_git_ref(git_repo, git_ref_name, old_oid, new_oid),
+    match old_commit_oid {
+        None => create_git_ref(git_repo, git_ref_name, new_commit_oid, new_ref_oid),
+        Some(old_oid) => move_git_ref(git_repo, git_ref_name, old_oid, new_commit_oid, new_ref_oid),
     }
 }
 
@@ -1637,7 +1704,7 @@ fn reset_index(
     git_repo: &gix::Repository,
     wc_commit: &Commit,
 ) -> Result<(), GitResetHeadError> {
-    let parent_tree = wc_commit.parent_tree(repo)?;
+    let parent_tree = wc_commit.parent_tree(repo).block_on()?;
     // Use the merged parent tree as the Git index, allowing `git diff` to show the
     // same changes as `jj diff`. If the merged parent tree has conflicts, then the
     // Git index will also be conflicted.
@@ -2984,6 +3051,15 @@ pub struct GitRefUpdate {
     pub new_target: Option<CommitId>,
 }
 
+/// Miscellaneous options for Git push command.
+#[derive(Clone, Debug, Default)]
+pub struct GitPushOptions {
+    /// Extra arguments passed in to `git push` command.
+    pub extra_args: Vec<String>,
+    /// `--push-option` arguments.
+    pub remote_push_options: Vec<String>,
+}
+
 /// Pushes the specified branches and updates the repo view accordingly.
 pub fn push_branches(
     mut_repo: &mut MutableRepo,
@@ -2991,6 +3067,7 @@ pub fn push_branches(
     remote: &RemoteName,
     targets: &GitBranchPushTargets,
     callback: &mut dyn GitSubprocessCallback,
+    options: &GitPushOptions,
 ) -> Result<GitPushStats, GitPushError> {
     validate_remote_name(remote)?;
 
@@ -3009,8 +3086,8 @@ pub fn push_branches(
         subprocess_options,
         remote,
         &ref_updates,
-        &[],
         callback,
+        options,
     )?;
     tracing::debug!(?push_stats);
 
@@ -3063,8 +3140,8 @@ pub fn push_updates(
     subprocess_options: GitSubprocessOptions,
     remote_name: &RemoteName,
     updates: &[GitRefUpdate],
-    extra_args: &[&str],
     callback: &mut dyn GitSubprocessCallback,
+    options: &GitPushOptions,
 ) -> Result<GitPushStats, GitPushError> {
     let mut qualified_remote_refs_expected_locations = HashMap::new();
     let mut refspecs = vec![];
@@ -3100,7 +3177,7 @@ pub fn push_updates(
         .map(|full_refspec| RefToPush::new(full_refspec, &qualified_remote_refs_expected_locations))
         .collect();
 
-    let mut push_stats = git_ctx.spawn_push(remote_name, &refs_to_push, extra_args, callback)?;
+    let mut push_stats = git_ctx.spawn_push(remote_name, &refs_to_push, callback, options)?;
     push_stats.pushed.sort();
     push_stats.rejected.sort();
     push_stats.remote_rejected.sort();

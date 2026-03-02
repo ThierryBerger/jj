@@ -50,6 +50,7 @@ use jj_lib::git::GitImportError;
 use jj_lib::git::GitImportOptions;
 use jj_lib::git::GitImportStats;
 use jj_lib::git::GitPushError;
+use jj_lib::git::GitPushOptions;
 use jj_lib::git::GitPushStats;
 use jj_lib::git::GitRefKind;
 use jj_lib::git::GitRefUpdate;
@@ -2036,6 +2037,94 @@ fn test_export_refs_current_bookmark_changed() {
         git_id(&new_commit)
     );
     assert!(git_repo.head().unwrap().is_detached(), "HEAD is detached");
+}
+
+#[test]
+fn test_export_refs_worktree_head_changed() {
+    let test_data = GitRepoData::create();
+    let import_options = default_import_options();
+    let git_repo = test_data.git_repo;
+    let commit1 = empty_git_commit(&git_repo, "refs/heads/main", &[]);
+    testutils::git::set_symbolic_reference(&git_repo, "HEAD", "refs/heads/main");
+
+    let worktree_dir = test_data._temp_dir.path().join("git-wt");
+    let output = std::process::Command::new("git")
+        .args(["worktree", "add", "-b", "wt-branch"])
+        .arg(&worktree_dir)
+        .current_dir(git_repo.workdir().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Failed to create worktree: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut tx = test_data.repo.start_transaction();
+    let mut_repo = tx.repo_mut();
+    git::import_head(mut_repo).unwrap();
+    git::import_refs(mut_repo, &import_options).unwrap();
+    mut_repo.rebase_descendants().block_on().unwrap();
+
+    let new_commit = create_random_commit(mut_repo)
+        .set_parents(vec![jj_id(commit1)])
+        .write_unwrap();
+    mut_repo.set_local_bookmark_target(
+        "wt-branch".as_ref(),
+        RefTarget::normal(new_commit.id().clone()),
+    );
+    let stats = git::export_refs(mut_repo).unwrap();
+    assert!(stats.failed_bookmarks.is_empty());
+    assert!(stats.failed_tags.is_empty());
+
+    let git_repo_wt = gix::open(&worktree_dir).unwrap();
+    assert!(git_repo_wt.head().unwrap().is_detached());
+}
+
+#[test]
+fn test_export_refs_worktree_no_detach() {
+    let test_data = GitRepoData::create();
+    let import_options = default_import_options();
+    let git_repo = test_data.git_repo;
+    let commit1 = empty_git_commit(&git_repo, "refs/heads/main", &[]);
+    testutils::git::set_symbolic_reference(&git_repo, "HEAD", "refs/heads/main");
+
+    let worktree_dir = test_data._temp_dir.path().join("git-wt");
+    let output = std::process::Command::new("git")
+        .args(["worktree", "add", "-b", "wt-branch"])
+        .arg(&worktree_dir)
+        .current_dir(git_repo.workdir().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Failed to create worktree: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut tx = test_data.repo.start_transaction();
+    let mut_repo = tx.repo_mut();
+    git::import_head(mut_repo).unwrap();
+    git::import_refs(mut_repo, &import_options).unwrap();
+    mut_repo.rebase_descendants().block_on().unwrap();
+
+    let new_commit = create_random_commit(mut_repo)
+        .set_parents(vec![jj_id(commit1)])
+        .write_unwrap();
+    mut_repo.set_local_bookmark_target(
+        "other-branch".as_ref(),
+        RefTarget::normal(new_commit.id().clone()),
+    );
+    let stats = git::export_refs(mut_repo).unwrap();
+    assert!(stats.failed_bookmarks.is_empty());
+    assert!(stats.failed_tags.is_empty());
+
+    let git_repo_wt = gix::open(&worktree_dir).unwrap();
+    assert!(!git_repo_wt.head().unwrap().is_detached());
+    assert_eq!(
+        git_repo_wt.head_name().unwrap().unwrap().as_bstr(),
+        b"refs/heads/wt-branch"
+    );
 }
 
 #[test]
@@ -4053,6 +4142,7 @@ fn test_fetch_export_annotated_tags() {
     // Create tags at remote
     let commit1 = empty_git_commit(&test_data.origin_repo, "refs/tags/tag1", &[]);
     let commit2 = empty_git_commit(&test_data.origin_repo, "refs/heads/main", &[]);
+    let commit3 = empty_git_commit(&test_data.origin_repo, "refs/tags/tag3.4", &[]);
     let kind = gix::object::Kind::Commit;
     let constraint = gix::refs::transaction::PreviousValue::MustNotExist;
     let tag2_oid = test_data
@@ -4062,6 +4152,7 @@ fn test_fetch_export_annotated_tags() {
         .id();
     let target1 = RefTarget::normal(jj_id(commit1));
     let target2 = RefTarget::normal(jj_id(commit2));
+    let target3 = RefTarget::normal(jj_id(commit3));
     let remote_ref1 = RemoteRef {
         target: target1.clone(),
         state: RemoteRefState::Tracked,
@@ -4070,10 +4161,23 @@ fn test_fetch_export_annotated_tags() {
         target: target2.clone(),
         state: RemoteRefState::Tracked,
     };
+    let remote_ref3 = RemoteRef {
+        target: target3.clone(),
+        state: RemoteRefState::Tracked,
+    };
 
-    // Fetch tags, merge remote tags, and export merged local tags to Git
+    // Fetch tags, merge remote tags, update one of merged local tags, and
+    // export local tags to Git
     let mut tx = test_data.repo.start_transaction();
     fetch_import(tx.repo_mut());
+    let commit4 = write_random_commit(tx.repo_mut());
+    let target4 = RefTarget::normal(commit4.id().clone());
+    let remote_ref4 = RemoteRef {
+        target: target4.clone(),
+        state: RemoteRefState::Tracked,
+    };
+    tx.repo_mut()
+        .set_local_tag_target("tag3.4".as_ref(), target4.clone());
     git::export_refs(tx.repo_mut()).unwrap();
     let repo = tx.commit("test").block_on().unwrap();
 
@@ -4095,6 +4199,16 @@ fn test_fetch_export_annotated_tags() {
         repo.view().get_remote_tag(remote_symbol("tag2", "origin")),
         &remote_ref2
     );
+    assert_eq!(repo.view().get_local_tag("tag3.4".as_ref()), &target4);
+    assert_eq!(
+        repo.view().get_remote_tag(remote_symbol("tag3.4", "git")),
+        &remote_ref4
+    );
+    assert_eq!(
+        repo.view()
+            .get_remote_tag(remote_symbol("tag3.4", "origin")),
+        &remote_ref3
+    );
 
     assert_eq!(
         test_data
@@ -4104,22 +4218,23 @@ fn test_fetch_export_annotated_tags() {
             .id(),
         commit1
     );
-    // TODO: somehow export the original annotated tag as local Git tag.
+    // Exported local tag should point to the original annotated tag
     assert_eq!(
         test_data
             .git_repo
             .find_reference("refs/tags/tag2")
             .unwrap()
             .id(),
-        commit2
+        tag2_oid
     );
-    assert_ne!(
+    // Locally-moved tag shouldn't point to the original remote tag target
+    assert_eq!(
         test_data
             .git_repo
-            .find_reference("refs/tags/tag2")
+            .find_reference("refs/tags/tag3.4")
             .unwrap()
             .id(),
-        tag2_oid
+        git_id(&commit4)
     );
 }
 
@@ -4397,6 +4512,7 @@ fn test_push_bookmarks_success() {
         "origin".as_ref(),
         &targets,
         &mut NullCallback,
+        &GitPushOptions::default(),
     )
     .unwrap();
     insta::assert_debug_snapshot!(stats, @r#"
@@ -4476,6 +4592,7 @@ fn test_push_bookmarks_deletion() {
         "origin".as_ref(),
         &targets,
         &mut NullCallback,
+        &GitPushOptions::default(),
     )
     .unwrap();
     insta::assert_debug_snapshot!(stats, @r#"
@@ -4554,6 +4671,7 @@ fn test_push_bookmarks_mixed_deletion_and_addition() {
         "origin".as_ref(),
         &targets,
         &mut NullCallback,
+        &GitPushOptions::default(),
     )
     .unwrap();
     insta::assert_debug_snapshot!(stats, @r#"
@@ -4635,6 +4753,7 @@ fn test_push_bookmarks_not_fast_forward() {
         "origin".as_ref(),
         &targets,
         &mut NullCallback,
+        &GitPushOptions::default(),
     )
     .unwrap();
     insta::assert_debug_snapshot!(stats, @r#"
@@ -4688,6 +4807,7 @@ fn test_push_bookmarks_partial_success() {
         "origin".as_ref(),
         &targets,
         &mut NullCallback,
+        &GitPushOptions::default(),
     )
     .unwrap();
     insta::assert_debug_snapshot!(stats, @r#"
@@ -4797,6 +4917,7 @@ fn test_push_bookmarks_unmapped_refs() {
         "origin".as_ref(),
         &targets,
         &mut NullCallback,
+        &GitPushOptions::default(),
     )
     .unwrap();
     insta::assert_debug_snapshot!(stats, @r#"
@@ -4893,8 +5014,8 @@ fn test_push_updates_unexpectedly_moved_sideways_on_remote() {
             subprocess_options,
             "origin".as_ref(),
             &targets,
-            &[],
             &mut NullCallback,
+            &GitPushOptions::default(),
         )
     };
 
@@ -4978,8 +5099,8 @@ fn test_push_updates_unexpectedly_moved_forward_on_remote() {
             subprocess_options,
             "origin".as_ref(),
             &targets,
-            &[],
             &mut NullCallback,
+            &GitPushOptions::default(),
         )
     };
 
@@ -5043,8 +5164,8 @@ fn test_push_updates_unexpectedly_exists_on_remote() {
             subprocess_options,
             "origin".as_ref(),
             &targets,
-            &[],
             &mut NullCallback,
+            &GitPushOptions::default(),
         )
     };
 
@@ -5080,8 +5201,8 @@ fn test_push_updates_success() {
             expected_current_target: Some(setup.main_commit.id().clone()),
             new_target: Some(setup.child_of_main_commit.id().clone()),
         }],
-        &[],
         &mut NullCallback,
+        &GitPushOptions::default(),
     )
     .unwrap();
     insta::assert_debug_snapshot!(stats, @r#"
@@ -5127,8 +5248,8 @@ fn test_push_updates_no_such_remote() {
             expected_current_target: Some(setup.main_commit.id().clone()),
             new_target: Some(setup.child_of_main_commit.id().clone()),
         }],
-        &[],
         &mut NullCallback,
+        &GitPushOptions::default(),
     );
     assert!(matches!(result, Err(GitPushError::NoSuchRemote(_))));
 }
@@ -5148,8 +5269,8 @@ fn test_push_updates_invalid_remote() {
             expected_current_target: Some(setup.main_commit.id().clone()),
             new_target: Some(setup.child_of_main_commit.id().clone()),
         }],
-        &[],
         &mut NullCallback,
+        &GitPushOptions::default(),
     );
     assert!(matches!(result, Err(GitPushError::NoSuchRemote(_))));
 }
@@ -5183,6 +5304,7 @@ fn test_push_environment_options() {
         "origin".as_ref(),
         &targets,
         &mut NullCallback,
+        &GitPushOptions::default(),
     )
     .unwrap();
 
@@ -5794,6 +5916,109 @@ fn test_remote_add_with_tags_specification(fetch_tags: gix::remote::fetch::Tags)
             .expect("unable to find remote")
             .fetch_tags()
     );
+}
+
+#[test]
+fn test_push_updates_with_options() {
+    let settings = testutils::user_settings();
+    let temp_dir = testutils::new_temp_dir();
+    let setup = set_up_push_repos(&settings, &temp_dir);
+    let git_settings = GitSettings::from_settings(&settings).unwrap();
+
+    std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&setup.source_repo_dir)
+        .args(["config", "receive.advertisePushOptions", "true"])
+        .output()
+        .unwrap();
+
+    // Set up pre-receive hook to echo back received options
+    let hooks_dir = setup.source_repo_dir.join("hooks");
+    fs::create_dir_all(&hooks_dir).unwrap();
+    let hook_path = hooks_dir.join("pre-receive");
+    let hook_content = r#"#!/bin/sh
+    if [ -n "$GIT_PUSH_OPTION_COUNT" ] && [ "$GIT_PUSH_OPTION_COUNT" -gt 0 ]; then
+        i=0
+        while [ $i -lt "$GIT_PUSH_OPTION_COUNT" ]; do
+            eval "option_value=\$GIT_PUSH_OPTION_$i"
+            echo "Push-Option: $option_value"
+            i=$((i + 1))
+        done
+    fi
+    "#;
+    fs::write(&hook_path, hook_content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    let remote_output = Arc::new(std::sync::Mutex::new(Vec::new()));
+    struct CapturingCallback {
+        output: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+    impl GitSubprocessCallback for CapturingCallback {
+        fn needs_progress(&self) -> bool {
+            false
+        }
+        fn progress(&mut self, _progress: &git::GitProgress) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn local_sideband(
+            &mut self,
+            _message: &[u8],
+            _term: Option<GitSidebandLineTerminator>,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remote_sideband(
+            &mut self,
+            message: &[u8],
+            _term: Option<GitSidebandLineTerminator>,
+        ) -> std::io::Result<()> {
+            if let Ok(mut output) = self.output.lock() {
+                output.extend_from_slice(message);
+            }
+            Ok(())
+        }
+    }
+    let mut callback = CapturingCallback {
+        output: remote_output.clone(),
+    };
+
+    let result = git::push_updates(
+        setup.jj_repo.as_ref(),
+        git_settings.to_subprocess_options(),
+        "origin".as_ref(),
+        &[GitRefUpdate {
+            qualified_name: "refs/heads/main".into(),
+            expected_current_target: Some(setup.main_commit.id().clone()),
+            new_target: Some(setup.child_of_main_commit.id().clone()),
+        }],
+        &mut callback,
+        &GitPushOptions {
+            extra_args: vec![],
+            remote_push_options: vec![
+                "merge_request.create".to_owned(),
+                "merge_request.draft".to_owned(),
+            ],
+        },
+    );
+
+    let stats = result.unwrap();
+    assert_eq!(
+        stats.pushed,
+        vec![jj_lib::ref_name::GitRefNameBuf::from("refs/heads/main")]
+    );
+    assert!(stats.rejected.is_empty());
+    assert!(stats.remote_rejected.is_empty());
+    assert!(stats.unexported_bookmarks.is_empty());
+
+    let captured_bytes = remote_output.lock().unwrap();
+    let captured_string = String::from_utf8_lossy(&captured_bytes);
+    assert!(captured_string.contains("Push-Option: merge_request.create"));
+    assert!(captured_string.contains("Push-Option: merge_request.draft"));
 }
 
 #[test]

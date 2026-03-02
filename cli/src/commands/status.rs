@@ -21,7 +21,6 @@ use jj_lib::repo_path::RepoPath;
 use jj_lib::repo_path::RepoPathBuf;
 use jj_lib::revset::RevsetExpression;
 use jj_lib::revset::RevsetFilterPredicate;
-use pollster::FutureExt as _;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
@@ -58,7 +57,7 @@ pub(crate) struct StatusArgs {
 }
 
 #[instrument(skip_all)]
-pub(crate) fn cmd_status(
+pub(crate) async fn cmd_status(
     ui: &mut Ui,
     command: &CommandHelper,
     args: &StatusArgs,
@@ -81,7 +80,7 @@ pub(crate) fn cmd_status(
     let formatter = formatter.as_mut();
 
     if let Some(wc_commit) = &maybe_wc_commit {
-        let parent_tree = wc_commit.parent_tree(repo.as_ref())?;
+        let parent_tree = wc_commit.parent_tree(repo.as_ref()).await?;
         let tree = wc_commit.tree();
 
         print_unmatched_explicit_paths(ui, &workspace_command, &fileset_expression, [&tree])?;
@@ -109,7 +108,7 @@ pub(crate) fn cmd_status(
                         &copy_records,
                         width,
                     )
-                    .block_on()?;
+                    .await?;
             }
 
             if wc_has_untracked {
@@ -131,7 +130,7 @@ pub(crate) fn cmd_status(
                         Ok(())
                     },
                 )
-                .block_on()?;
+                .await?;
             }
         }
 
@@ -139,8 +138,7 @@ pub(crate) fn cmd_status(
         write!(formatter, "Working copy  (@) : ")?;
         template.format(wc_commit, formatter)?;
         writeln!(formatter)?;
-        for parent in wc_commit.parents() {
-            let parent = parent?;
+        for parent in wc_commit.parents().await? {
             //                "Working copy  (@) : "
             write!(formatter, "Parent commit (@-): ")?;
             template.format(&parent, formatter)?;
@@ -171,8 +169,7 @@ pub(crate) fn cmd_status(
 
             workspace_command.report_repo_conflicts(formatter, repo, ancestors_conflicts)?;
         } else {
-            for parent in wc_commit.parents() {
-                let parent = parent?;
+            for parent in wc_commit.parents().await? {
                 if parent.has_conflict() {
                     writeln!(
                         formatter.labeled("hint").with_heading("Hint: "),
@@ -295,6 +292,7 @@ async fn visit_collapsed_untracked_files(
 
 #[cfg(test)]
 mod test {
+    use pollster::FutureExt as _;
     use testutils::TestRepo;
     use testutils::TestTreeBuilder;
     use testutils::repo_path;

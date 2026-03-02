@@ -14,13 +14,13 @@
 
 use clap_complete::ArgValueCandidates;
 use clap_complete::ArgValueCompleter;
+use futures::future::try_join_all;
 use indexmap::IndexSet;
 use itertools::Itertools as _;
 use jj_lib::copies::CopyRecords;
 use jj_lib::merge::Diff;
 use jj_lib::repo::Repo as _;
 use jj_lib::rewrite::merge_commit_trees;
-use pollster::FutureExt as _;
 use tracing::instrument;
 
 use crate::cli_util::CommandHelper;
@@ -113,7 +113,7 @@ pub(crate) struct DiffArgs {
 }
 
 #[instrument(skip_all)]
-pub(crate) fn cmd_diff(
+pub(crate) async fn cmd_diff(
     ui: &mut Ui,
     command: &CommandHelper,
     args: &DiffArgs,
@@ -170,10 +170,14 @@ pub(crate) fn cmd_diff(
             .try_collect()?;
 
         // Collect parents outside of revset to preserve parent order
-        let parents: IndexSet<_> = roots.iter().flat_map(|c| c.parents()).try_collect()?;
+        let parents: IndexSet<_> = try_join_all(roots.iter().map(|c| c.parents()))
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
         let parents = parents.into_iter().collect_vec();
-        from_tree = merge_commit_trees(repo.as_ref(), &parents).block_on()?;
-        to_tree = merge_commit_trees(repo.as_ref(), &heads).block_on()?;
+        from_tree = merge_commit_trees(repo.as_ref(), &parents).await?;
+        to_tree = merge_commit_trees(repo.as_ref(), &heads).await?;
 
         for p in &parents {
             for to in &heads {
@@ -203,7 +207,7 @@ pub(crate) fn cmd_diff(
     ui.request_pager();
     if let Some(template) = &maybe_template {
         let tree_diff = from_tree.diff_stream_with_copies(&to_tree, &matcher, &copy_records);
-        show_templated(ui.stdout_formatter().as_mut(), tree_diff, template).block_on()?;
+        show_templated(ui.stdout_formatter().as_mut(), tree_diff, template).await?;
     }
     diff_renderer
         .show_diff(
@@ -214,7 +218,7 @@ pub(crate) fn cmd_diff(
             &copy_records,
             ui.term_width(),
         )
-        .block_on()?;
+        .await?;
     print_unmatched_explicit_paths(
         ui,
         &workspace_command,

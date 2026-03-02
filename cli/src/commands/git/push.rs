@@ -30,6 +30,7 @@ use jj_lib::commit::CommitIteratorExt as _;
 use jj_lib::config::ConfigGetResultExt as _;
 use jj_lib::git;
 use jj_lib::git::GitBranchPushTargets;
+use jj_lib::git::GitPushOptions;
 use jj_lib::git::GitSettings;
 use jj_lib::index::IndexResult;
 use jj_lib::op_store::RefTarget;
@@ -46,16 +47,17 @@ use jj_lib::refs::classify_bookmark_push_action;
 use jj_lib::repo::Repo;
 use jj_lib::revset::RemoteRefSymbolExpression;
 use jj_lib::revset::RevsetExpression;
+use jj_lib::rewrite::CommitRewriter;
 use jj_lib::signing::SignBehavior;
 use jj_lib::str_util::StringExpression;
 use jj_lib::view::View;
-use pollster::FutureExt as _;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::RevisionArg;
 use crate::cli_util::WorkspaceCommandHelper;
 use crate::cli_util::WorkspaceCommandTransaction;
 use crate::cli_util::has_tracked_remote_bookmarks;
+use crate::cli_util::short_change_hash;
 use crate::cli_util::short_commit_hash;
 use crate::command_error::CommandError;
 use crate::command_error::cli_error;
@@ -202,6 +204,10 @@ pub struct GitPushArgs {
     /// Only display what will change on the remote
     #[arg(long)]
     dry_run: bool,
+
+    /// Git push options
+    #[arg(long, short)]
+    option: Vec<String>,
 }
 
 fn make_bookmark_term(bookmark_names: &[impl fmt::Display]) -> String {
@@ -222,7 +228,7 @@ enum BookmarkMoveDirection {
     Sideways,
 }
 
-pub fn cmd_git_push(
+pub async fn cmd_git_push(
     ui: &mut Ui,
     command: &CommandHelper,
     args: &GitPushArgs,
@@ -437,7 +443,8 @@ pub fn cmd_git_push(
             commits_to_sign,
             sign_behavior,
             bookmark_updates,
-        )?;
+        )
+        .await?;
         if let Some(mut formatter) = ui.status_formatter() {
             writeln!(
                 formatter,
@@ -470,12 +477,17 @@ pub fn cmd_git_push(
         branch_updates: bookmark_updates,
     };
     let git_settings = GitSettings::from_settings(tx.settings())?;
+    let options = GitPushOptions {
+        extra_args: vec![],
+        remote_push_options: args.option.clone(),
+    };
     let push_stats = git::push_branches(
         tx.repo_mut(),
         git_settings.to_subprocess_options(),
         remote,
         &targets,
         &mut GitSubprocessUi::new(ui),
+        &options,
     )?;
     print_push_stats(ui, &push_stats)?;
     // TODO: On partial success, locally-created --change/--named bookmarks will
@@ -588,9 +600,9 @@ fn validate_commits_ready_to_push(
 ///
 /// Returns the number of commits with rebased descendants and the updated list
 /// of bookmark names and corresponding [`BookmarkPushUpdate`]s.
-fn sign_commits_before_push(
+async fn sign_commits_before_push(
     ui: &Ui,
-    tx: &mut WorkspaceCommandTransaction,
+    tx: &mut WorkspaceCommandTransaction<'_>,
     commits_to_sign: Vec<Commit>,
     sign_behavior: SignBehavior,
     bookmark_updates: Vec<(RefNameBuf, BookmarkPushUpdate)>,
@@ -598,30 +610,37 @@ fn sign_commits_before_push(
     let commit_ids: IndexSet<CommitId> = commits_to_sign.iter().ids().cloned().collect();
     let mut old_to_new_commits_map: HashMap<CommitId, CommitId> = HashMap::new();
     let mut num_rebased_descendants = 0;
-    let mut progress_writer = ProgressWriter::new(ui, "Signing");
+    {
+        let mut progress_writer = ProgressWriter::new(ui, "Signing");
 
-    tx.repo_mut()
-        .transform_descendants(commit_ids.iter().cloned().collect_vec(), async |rewriter| {
-            let old_commit = rewriter.old_commit();
-            let old_commit_id = old_commit.id().clone();
-            if let Some(writer) = &mut progress_writer {
-                writer.display(&old_commit.change_id().reverse_hex()).ok();
-            }
-            if commit_ids.contains(&old_commit_id) {
-                let commit = rewriter
-                    .reparent()
-                    .set_sign_behavior(sign_behavior)
-                    .write()
-                    .await?;
-                old_to_new_commits_map.insert(old_commit_id, commit.id().clone());
-            } else {
-                num_rebased_descendants += 1;
-                let commit = rewriter.reparent().write().await?;
-                old_to_new_commits_map.insert(old_commit_id, commit.id().clone());
-            }
-            Ok(())
-        })
-        .block_on()?;
+        tx.repo_mut()
+            .transform_descendants(
+                commit_ids.iter().cloned().collect_vec(),
+                async |rewriter: CommitRewriter<'_>| {
+                    let old_commit = rewriter.old_commit();
+                    let old_commit_id = old_commit.id().clone();
+                    if let Some(writer) = &mut progress_writer {
+                        writer
+                            .display(&short_change_hash(old_commit.change_id()))
+                            .ok();
+                    }
+                    if commit_ids.contains(&old_commit_id) {
+                        let commit = rewriter
+                            .reparent()
+                            .set_sign_behavior(sign_behavior)
+                            .write()
+                            .await?;
+                        old_to_new_commits_map.insert(old_commit_id, commit.id().clone());
+                    } else {
+                        num_rebased_descendants += 1;
+                        let commit = rewriter.reparent().write().await?;
+                        old_to_new_commits_map.insert(old_commit_id, commit.id().clone());
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
+    }
 
     let bookmark_updates = bookmark_updates
         .into_iter()

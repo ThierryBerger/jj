@@ -2079,8 +2079,7 @@ to the current parents may contain changes from multiple commits.
             write!(formatter, "Working copy  (@) now at: ")?;
             template.format(new_commit, formatter.as_mut())?;
             writeln!(formatter)?;
-            for parent in new_commit.parents() {
-                let parent = parent?;
+            for parent in new_commit.parents().block_on()? {
                 //                "Working copy  (@) now at: "
                 write!(formatter, "Parent commit (@-)      : ")?;
                 template.format(&parent, formatter.as_mut())?;
@@ -4001,7 +4000,9 @@ impl<'a> CliRunner<'a> {
             revset_extensions: Default::default(),
             commit_template_extensions: vec![],
             operation_template_extensions: vec![],
-            dispatch_fn: Box::new(crate::commands::run_command),
+            dispatch_fn: Box::new(|ui, command_helper| {
+                crate::commands::run_command(ui, command_helper).block_on()
+            }),
             dispatch_hook_fns: vec![],
             process_global_args_fns: vec![],
         }

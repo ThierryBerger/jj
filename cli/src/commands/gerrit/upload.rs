@@ -22,6 +22,7 @@ use itertools::Itertools as _;
 use jj_lib::backend::CommitId;
 use jj_lib::commit::Commit;
 use jj_lib::git;
+use jj_lib::git::GitPushOptions;
 use jj_lib::git::GitRefUpdate;
 use jj_lib::git::GitSubprocessOptions;
 use jj_lib::object_id::ObjectId as _;
@@ -31,7 +32,6 @@ use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
 use jj_lib::trailer::Trailer;
 use jj_lib::trailer::parse_description_trailers;
-use pollster::FutureExt as _;
 
 use crate::cli_util::CommandHelper;
 use crate::cli_util::RevisionArg;
@@ -372,13 +372,17 @@ fn push_options(args: &UploadArgs) -> Result<Vec<String>, CommandError> {
     .collect())
 }
 
-pub fn cmd_gerrit_upload(
+pub async fn cmd_gerrit_upload(
     ui: &mut Ui,
     command: &CommandHelper,
     args: &UploadArgs,
 ) -> Result<(), CommandError> {
     // Do this first because the validation is cheap.
-    let push_options = push_options(args)?;
+    let push_options = GitPushOptions {
+        // TODO: migrate push_options() away from extra_args?
+        extra_args: push_options(args)?,
+        remote_push_options: vec![],
+    };
 
     let mut workspace_command = command.workspace_helper(ui)?;
 
@@ -581,7 +585,7 @@ pub fn cmd_gerrit_upload(
             .set_committer(original_commit.committer().clone())
             .set_author(original_commit.author().clone())
             .write()
-            .block_on()?;
+            .await?;
 
         old_to_new.insert(original_commit.id().clone(), new_commit);
     }
@@ -632,8 +636,8 @@ pub fn cmd_gerrit_upload(
                 expected_current_target: None,
                 new_target: Some(new_commit.id().clone()),
             }],
-            &push_options.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             &mut GitSubprocessUi::new(ui),
+            &push_options,
         )
         // Despite the fact that a manual git push will error out with 'no new
         // changes' if you're up to date, this git backend appears to silently
